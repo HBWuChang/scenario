@@ -1,0 +1,349 @@
+/*------------------------------------------------------------------------------
+/		Copyright (C) サークル煌明	All Rights Reserved.
+/			MotionBlurPlugin Ver.0.5X
+/ 
+/ 吉里吉里・KAG にモーションブラー機能を追加するプラグイン
+/ ブラーしない、普通の拡縮回転も可能です
+/ 
+/ 　KAG の前景レイヤを指定すると、そのレイヤをプラグイン内にコピーして実行するの
+/ で、前景レイヤは一切弄りません。前景レイヤを動かしているように見せたい場合、不
+/ 可視にするなどして対処してください
+/ 
+/ 　かなり重い処理をするので、遅いパソコンを持っている人のことも考えて、
+/ 一度に多数の画像を動かすのは止した方が良いと思いますよ。
+/ 
+/ 属性
+/  ○ ax, ay : 実行中に移動する中心座標の量
+/  ○ rot, drot : 回転率・初期回転率 π指定 (以下 d は default の d)
+/  ○ mag, dmag : 拡大率・初期拡大率
+/  ○ opa, dopa : 透明度・初期透明度
+/  ○ blur : 残像を残す？ (残せばモーションブラー)
+/  ○ time : 実行時間
+/  ○ accel : 加速度をもった進行？
+/  ○ once : 一回だけ実行 (time, accel 無視 で最終結果(ブラー無し)を表示する)
+/  ○ erase : 実行終了後すぐにレイヤを消す？
+/  ○ dx, dy : 拡縮回転の中心座標 (デフォルトは画面の中心)
+/  ○ absolute : レイヤ深度
+/  ○ image, left, top : 画像読み込み
+/  ○ layer : KAGレイヤの指定
+/  ○ quickescape (0.5X から実装)
+/ 	複数ある @motionblur 内のどれか一つで指定してくれれば OK。
+/ 	すべての描画が終了した後、画面を消すタグ (@motionblur_clear) を待たずに
+/ 	画面をクリアするかを設定します。
+/ 	標準は 偽 、つまり描画終了しても画面は自動でクリアされません。
+/ 	偽を指定すると @motionblur_clear タグを挟むまで画面に結果が出続けますが、ラ
+/ 	ベルを跨ぐ前に必ず @motionblur_clear は実行してください。
+/-----------------------------------------------------------------------------*/
+@if(__MOTIONBLURPLUGIN_OBJECT_DEFINED__==0)
+@set(__MOTIONBLURPLUGIN_OBJECT_DEFINED__=1)
+
+class MotionBlurPlugin extends KAGPlugin {
+	var window;
+
+	var propers = [];	// px～ をレイヤ毎に個別に保管する二次元配列
+
+	var conductor;		// 実行者 - 分岐テスト
+	var doing = false;	// このプラグインが実行中か
+	var absolute = 165000;
+
+	var quickescape = false;	// 全部実行終了後、画面を消すタグを待たずに画面をクリアするか
+
+	var timer;
+
+	function MotionBlurPlugin(window) {
+		super.KAGPlugin();
+		this.window	= window;
+		timer = new Timer(onTimer, "");
+	}
+
+	function finalize() {
+		stop();
+		super.finalize(...);
+	}
+
+	function set(elm) {
+		var start = System.getTickCount();
+		var base = kag.fore.base;
+		var tmpproper = %[];	// set 内で情報を一時的に格納する
+
+		quickescape = elm.quickescape if elm.quickescape !== void;
+		with(elm) {
+			var tp = tmpproper;
+		// ○ax, ay : 実行中に移動する中心座標の量
+			tp.ax		= int(.ax!==void ?		.ax	: 0);
+			tp.ay		= int(.ay!==void ?		.ay	: 0);
+		// ○rot, drot : 回転率・初期回転率 π指定 (以下 d は default の d)
+			tp.rot		= real(.rot!==void ?	-2*Math.PI*.rot	: 0.0);
+			tp.drot		= real(.drot!==void ?	-2*Math.PI*.drot: 0.0);
+		// ○mag, dmag : 拡大率・初期拡大率
+			tp.mag		= real(.mag!==void ?	.mag	: 1.0);
+			tp.dmag		= real(.dmag!==void ?	.dmag	: 1.0);
+		// ○opa, dopa : 透明度・初期透明度
+			tp.opa		= int(.opa!==void ?		.opa	: 0);
+			tp.dopa		= int(.dopa!==void ?	.dopa	: 255);
+		// ○blur : 残像を残す？ (残せばモーションブラー)
+			tp.blur		= .blur!==void ?		.blur	: false;
+		// ○time : 実行時間
+			tp.time		= int(.time!==void ?	.time	: 500);
+		// ○accel : 加速度をもった進行？
+			tp.accel	= .accel!==void ?		.accel	: false;
+		// ○once : 一回だけ実行 (time, accel 無視 で最終結果(ブラー無し)を表示する)
+			tp.once		= .once!==void ?		.once	: false;
+		// ○erase : 実行終了後すぐにレイヤを消す？
+			tp.erase	= .erase!==void ?		.erase	: false;
+		// ○dx, dy : 拡縮回転の中心座標 (デフォルトは画面の中心)
+
+		// 回転するかしないか
+			tp.conductor = (tp.rot||tp.drot)!==0.0 ? rotation : noRotation;
+		}
+
+		var p = propers[propers.count] = %[];			// 新しい辞書配列
+		(Dictionary.assign incontextof p)(tmpproper);	// 基礎情報をコピー
+
+		var tpos = [0,0,base.width,base.height];	// レイヤ位置決め用 仮 Pos 設定
+	// 表示用レイヤ確保
+		with(p.blurLayer = new Layer(kag, base)) {	// 表示用レイヤ確保
+			.visible = true;
+			.setPos(tpos*);
+			// 深度は、指定がなければ後から登録したものほど前に出る
+			.absolute = elm.absolute!==void ? elm.absolute : absolute++;
+			.holdAlpha = false;	// 偽の方が若干速い？っぽい
+			.hitThreshold = 256;	// 演出なので全域透過でOK？
+		}
+	// テンポラリレイヤ確保 ↓ - イメージ読み込み or KAG レイヤをコピー
+		var hl = p.holdLayer = new Layer(kag, base);
+		if(elm.image!==void) {
+			// イメージ読み込み
+			hl.loadImages(elm.image);
+			tpos = defineLayPoses(
+				tpos*,(int)elm.left,(int)elm.top,hl.imageWidth,hl.imageHeight
+			);
+			hl.setPos(tpos*);
+		} else if(elm.layer!==void) {
+			// KAG レイヤからコピー
+			var layerstmp = [];		// splitLayer 対象レイヤ保管用
+			splitLayer(layerstmp, [], elm.layer, 'fore');
+			// tmp レイヤ大きさ決定
+			for(var i=0;i<layerstmp.count;i++) {
+				var l = layerstmp[i];
+				tpos = defineLayPoses(tpos*,l.left,l.top,l.width,l.height);
+			}
+			hl.setPos(tpos*);
+			for(var i=0;i<layerstmp.count;i++) {
+				var l = layerstmp[i];
+				hl.operateRect( 	// 指定されたレイヤをコピー
+					l.left-tpos[0],l.top-tpos[1],l,0,0,l.width,l.height,,l.opacity
+				) if l.visible;
+			}
+		} else {
+			clearProper(propers.count-1);
+			return;		// イメージが指定されてないなら無かったことに
+		}
+	// テンポラリレイヤ確保 ↑
+
+		// ○dx, dy : 拡縮回転の中心座標 (デフォルトは画面の中心)
+		p.dx		= int(elm.dx!==void ?		elm.dx		: tpos[2]/2);
+		p.dy		= int(elm.dy!==void ?		elm.dy		: tpos[3]/2);
+
+		p.starttick = System.getTickCount();	// 開始時刻を設定
+		p.doing = true;							// 実行開始合図
+		if(p.once || p.time <= 32) {		// 一回だけモード
+			p.conductor(p, p.per=1.0);
+			finish(p, propers.count-1);
+		} else if(!doing) {	// 実行開始していないなら
+			timer.interval = 32;
+			timer.enabled = true;
+			doing = true;
+		}
+		dm('MotionBlurPlugin 作成に '+(System.getTickCount()-start)+'ms 掛かりました');
+	}
+
+	function onTimer() {
+		// ずれ防止のために、予めすべての進行度を求めてから描画する
+		var igno;
+		var p = propers;
+		for(var i=0;i<p.count;i++) {
+			with(p[i]) {
+				if(.doing) {
+					var pt = (System.getTickCount()-.starttick)/.time;
+					// 進行度は決して 1.0 以上にはならない
+					.per = pt>1.0 ? 1.0 : calcPerAccel(pt, .accel);
+				} else {
+					igno++;	// 実行終了した数
+				}
+			}
+		}
+
+		for(var i=0;i<p.count;i++) {
+			// .doing が false になった後は描かれない
+			if(p[i].doing) {
+				p[i].conductor(p[i]);
+				if(p[i].per>=1.0) { finish(p[i], i); i--; }
+			}
+		}
+		stop() if(igno>=p.count && doing);
+	}
+
+
+	function noRotation(propers) {
+		with(propers) {
+			var l = .blurLayer;
+			var hold = .holdLayer;
+			var m	= .dmag+(.mag-.dmag)*.per;	// mag は長いので m に
+			var tx	= .dx+.ax*.per;	// 中心座標から移動
+			var ty	= .dy+.ay*.per;
+			var topa = .dopa+(.opa-.dopa)*.per;
+			var px = hold.left;
+			var py = hold.top;
+
+			if(.blur) {
+				l.operateStretch(
+					(1-m)*tx+.px, (1-m)*ty+.py, hold.height*m, hold.height*m, 
+					hold, 0, 0, hold.width, hold.height, 
+					omAuto, topa, stNearest
+				);
+			} else {
+				l.opacity = topa;
+				l.copyRect(
+					(1-m)*tx+.px, (1-m)*ty+.py, hold, 0, 0, hold.width, hold.height
+				);
+			}
+		}
+	}
+
+	function rotation(propers) {
+		with(propers) {
+			var l = .blurLayer;
+			var hold = .holdLayer;
+			var m	= .dmag+(.mag-.dmag)*.per;	// mag は長いので m に
+			var tx	= .dx+.ax*.per;	// 中心座標から移動
+			var ty	= .dy+.ay*.per;
+			var topa = .dopa+(.opa-.dopa)*.per;
+			var px = hold.left;
+			var py = hold.top;
+
+			var rad	= .drot+(.rot-.drot)*.per;
+			var s	= Math.sin(rad), c = Math.cos(rad);
+
+			if(.blur) {
+				l.operateAffine(
+					hold, 0, 0, hold.width, hold.height, true, 
+					c*m, -s*m, s*m, c*m, tx-(tx*c+ty*s)*m+px, ty+(tx*s-ty*c)*m+py, 
+					omAuto, topa, stNearest
+				);
+			} else {
+			// 　ブラーしないとき、こっちの方が大分軽かったので、直接レイヤの透
+			// 明度を変化させることにしました。九割九分の人には関係ないけど、描
+			// 画中のレイヤをさらに弄りたい人はブラーしているかに注意して下さい
+			// 　回転しない場合 (noRotation() 内) でも同じです。
+				l.opacity = topa;
+				l.affineCopy(
+					hold, 0, 0, hold.width, hold.height, true, 
+					c*m, -s*m, s*m, c*m, tx-(tx*c+ty*s)*m+px, ty+(tx*s-ty*c)*m+py, 
+					stNearest, false
+				);
+			}
+		}
+	}
+
+	function clearBlur() {
+		for(var i=0;i<propers.count;i++) {
+			clearProper(i);
+			i--;			// propers は減っていくので同じ数で回す (while?)
+		}
+	}
+
+	function clearProper(i) {
+		invalidate propers[i].holdLayer;	// 一時レイヤはここで解放してかまわない
+		invalidate propers[i].blurLayer;	// レイヤ解放
+		propers.erase(i);				// 配列は前へ詰められる
+	}
+
+	function finish(proper, i) {
+		proper.per = 1.0;				// ここでも 1.0 にする
+		proper.doing = false;			// これ以後 onTimer の igno に追加される
+		clearProper(i) if proper.erase;	// erase ならこの時点で描画終了
+	}
+
+	function stop() {
+		if(doing) {
+			doing = false;
+			clearBlur() if quickescape;
+			quickescape = false;
+			absolute = 165000;
+			window.trigger("MotionBlur");
+			timer.enabled = false;
+		}
+	}
+
+	function defineLayPoses(la, ta, wa, ha, lb, tb, wb, hb) {
+	// a の中に b が内包されるように a の大きさを変更
+		if(la > lb) wa += (la-lb), la = lb;
+		if(ta > tb) ha += (ta-tb), ta = tb;
+		if((wb+lb) > (wa+la)) wa += ((wb+lb)-(wa+la));
+		if((hb+tb) > (ha+ta)) ha += ((hb+tb)-(ha+ta));
+		return [la, ta, wa, ha];
+	}
+
+/* -------------------------------------------------------------------------- */
+function calcPerAccel(per, accel) {
+	if(accel<=-2)
+		return per = 1.0 - Math.pow(1.0-per, -accel);
+	else if(accel>=2)
+		return per = Math.pow(per, accel);
+	else
+		return per;
+}
+
+function splitLayer(fores=[], backs=[], target, page="fore") {
+	var targets = [] = target.split(",", ,true);
+	var apage = page!=='fore' ? 'fore' : 'back';	// 指定ページ裏表逆
+
+	for(var i=0;i<targets.count;i++) {
+		var tar = targets[i];
+		if(tar==='base') {
+			fores.add(kag[page].base);
+			backs.add(kag[apage].base);
+		} else if(tar[0]==='m') {
+			if(tar==='message') {
+				fores.add(kag[page].messages[kag.currentNum]);
+				backs.add(kag[apage].messages[kag.currentNum]);
+			} else {
+				fores.add(kag[page].messages[+tar.substr(7)]);
+				backs.add(kag[apage].messages[+tar.substr(7)]);
+			}
+		} else if((/^[0-9]*$/.test(tar)) && tar<=kag.numCharacterLayers) {
+			fores.add(kag[page].layers[tar]);
+			backs.add(kag[apage].layers[tar]);
+		}
+	}
+}
+}
+
+// プラグインオブジェクトを作成し、登録する
+kag.addPlugin(global.MotionBlurPlugin_object = new MotionBlurPlugin(kag));
+// kag.tagHandlers.laycount(%[layers:kag.numCharacterLayers+1]);
+// MotionBlurPlugin_object.useLayer = kag.numCharacterLayers-1;
+
+kag.tagHandlers.motionblur = function(elm = %[]) {
+		if(kag.skipMode>=2)	elm.time = "0";
+		MotionBlurPlugin_object.set(elm);
+	return 0;
+} incontextof kag;
+
+kag.tagHandlers.waitmotionblur = function(elm = %[]) {
+	if(MotionBlurPlugin_object.doing) {
+		elm.canskip = elm.canskip!==void ? elm.canskip : false;
+		elm.name="MotionBlur", elm.onskip="MotionBlurPlugin_object.finish()";
+		return waitTrigger(elm);
+	}
+	else return 0;
+} incontextof kag;
+
+kag.tagHandlers.motionblur_clear = function(elm = %[]) {
+		elm.erase = true if elm.erase===void;
+		MotionBlurPlugin_object.clearBlur(elm);
+	return 0;
+} incontextof kag;
+
+@endif

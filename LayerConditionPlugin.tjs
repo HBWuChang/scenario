@@ -1,0 +1,585 @@
+/*------------------------------------------------------------------------------
+/		Copyright (C) サークル煌明	All Rights Reserved.
+/			LayerConditionPlugin Ver.0.9X
+/ @dependsOn layerExImage.dll
+/ 
+/ 偏向 : incleft, inctop :: 位置あわせ終了後どれだけ移動するか
+/ QuakexPluginはこれよりも前に読み込むこと。
+/-----------------------------------------------------------------------------*/
+@if(__LAYERCONDITIONPLUGIN_OBJECT_DEFINED__==0)
+@set(__LAYERCONDITIONPLUGIN_OBJECT_DEFINED__=1)
+//Scripts.execStorage("SubRoutine.tjs");
+try { Plugins.link("layerExImage.dll"); }
+catch(e) { dm("LayerConditionPlugin : layerExImage.dllが見つかりませんでした"); }
+
+class LayerConditionPlugin extends KAGPlugin {
+	var window;
+
+/*-- ↓ ユーザー個別設定 ここから --------------------------------------------*/
+	var configfile = "color.kef";	// コンフィグファイル名
+
+	// 差分画像読み込み用設定
+	var splitstring = '/';	// 分割する際の文字
+	var insert = '_';		// 間に組み込む文字列
+	var addstring = [, "顔", "髪", "特殊"];		// 前景用ジャンル分け
+//	var addstring = ["立ち絵", "顔", "髪", "特殊"];		// 前景用ジャンル分け
+	var addstringForBase = [];							// 背景専用ジャンル分け
+
+	// コンディションを背景レイヤとして扱う前景レイヤ番号
+	// 指定された前景レイヤは、背景であるかのようにコンディションが掛かります
+	var likeabase = 0;
+/*-- ↑ ユーザー個別設定 ここまで --------------------------------------------*/
+
+	// これより下は @setLayerConditionConfig タグで設定します
+	var pluginenabled = true;	// このプラグインを使用するか
+	var imageface = dfAlpha;
+	var imagetype = ltAlpha;// 前景、背景のタイプ
+
+	var positionenabled = true;	// 自動立ち絵位置決めを使用するか
+	var llower = 0;			// 立ち絵制御適用前景レイヤ下限
+	var lupper = 4;			// 立ち絵制御適用前景レイヤ上限
+	var mllower = 0;		// 前景レイヤ下限(このプラグインの効果の及ぶ範囲)
+	var mlupper = 4;		// 前景レイヤ上限
+	// llower ～ lupperで指定されたレイヤの、自動位置決め時のレイヤ中心位置
+	var layer_position = [263, 131, 263, 395, 0];
+	var layer_absolute = [1000, 6000, 7000, 8000, 9000];	// 立ち絵制御用 深度設定
+	var attachbottom = false;	// 立ち絵の位置決めで、画像の下端を画面の下端に合わせるか
+
+
+
+	var imageHoldAlpha = true;
+	var bcondition = void;
+	var lcondition = void;	// 現在の前景と背景の個別コンディション参照用
+	var conditionname = void;	// (S&L参照用) 現在のコンディションの名前
+	var bcondname, lcondname;
+
+	var situations = %[];		// ここに configfile を突っ込む
+	var tempcondition;			// 一時コンディションモード - b と l に分けた %[]
+	var layer_image = %[];		// 読込画像の名前を保存 - 表裏の区別はなし
+	var layer_opts = %[];		// 読込画像の属性を保存
+
+	// 一時C 各パラメータの名前。この名前で属性指定すれば 一時C を指定できる。
+	// b_ l_ を先頭に付けるとレイヤ別コンディションになる。bases layers と併用可
+	var paramnames = [
+	 "grayscale",
+	 "rcolor","gcolor","bcolor","coloropa",
+	 "rgamma","ggamma","bgamma","rfloor","gfloor","bfloor","rceil","gceil","bceil",
+	 "rdodge","gdodge","bdodge","dodgeopa",
+	 "brightness","contrast",
+	 "hue","sat","blend",
+	 "bowablur","bowaltype","bowalopa",
+	 "xblur","yblur"
+	];
+
+	var dodgeLayer, lightlayer;
+
+	function LayerConditionPlugin(window) {
+		super.KAGPlugin();
+		this.window = window;
+
+		// 読み込まれていなければ、外部からファイルを読み込む
+		if(Storages.isExistentStorage(configfile))
+			situations = Scripts.evalStorage(configfile);
+		eraseCondition();		// 一応初期化
+
+		with(dodgeLayer = new Layer(window, window.primaryLayer)) {
+			.type = ltDodge;
+			.face = dfAlpha;
+			.opacity = 255;
+			.hitThreshold = 256;
+			.visible = false;
+			.holdAlpha = true;
+		}
+		with(lightlayer = new Layer(window, window.primaryLayer)) {
+			.type = ltAlpha;
+			.face = dfAlpha;
+			.hitThreshold = 256;
+			.visible = false;
+		}
+	}
+
+	function finalize() {
+		stop();
+		super.finalize(...);
+	}
+
+	function setLayerCondition(l, s, n) {
+	// l==対象のレイヤ s==コンディションの配列への参照 n==背景？前景？
+		// 設定がないか、あるいは画像が読まれていないなら戻る
+		if(layer_image[(string)n]===void || s===void ) {
+			return;
+		} else if(conditionname==='nothing') {
+			eraseCondition();
+		}
+
+		l.face	= dfOpaque;	// マスクには描画しない
+		if(s[0]==1) {
+			l.doGrayScale();
+		} if(s[4]>0) {
+			l.colorRect(0, 0, l.width, l.height, ten2sixt(,s[1],s[2],s[3]), s[4]);
+		} if(s[5]!=1 || s[8]!=1 || s[11]!=1) {
+			l.adjustGamma(s[5],s[8],s[11],s[6],s[9],s[12],s[7],s[10],s[13]);
+		} if(s[17] > 0) {
+			with(dodgeLayer) {
+				.setPos(l.left, l.top, l.imageWidth, l.imageHeight );
+				.fillRect(0, 0, .width, .height, 
+					s[17]>0 ? ten2sixt(255, s[14], s[15], s[16]) : 0x00000000
+				);
+
+				var orghold = l.holdAlpha;
+				l.holdAlpha = true;
+				l.operateRect(0, 0, dodgeLayer, 0, 0, .width, .height, omAuto, s[17]);
+				l.holdAlpha = orghold;
+			}
+		} if(s[18]!=0 || s[19]!=0) {
+			l.light(s[18], s[19]);
+		} if(s[20]!=0 || s[21]!=0 || s[22]!=0) {
+			l.colorize(s[20], s[21], s[22]);
+		} if(s[23]>0) {		// KAGEX layerex.tjs よりぼわぼわ光効果
+			with(lightlayer) {
+				.setPos(l.left, l.top, l.imageWidth, l.imageHeight );
+				.assignImages(l);
+				.doBoxBlur(s[23], s[23]);
+				l.operateRect(0, 0, lightlayer, 0, 0, .width, .height, ltPsNormal, s[24]);
+				l.operateRect(0, 0, lightlayer, 0, 0, .width, .height, ltPsHardLight, s[25]);
+			}
+		} if(s[26]>0 || s[27]>0) {		// blur
+			l.doBoxBlur(s[26], s[27]);
+		}
+		l.face	= dfAlpha;	// マスクにも描画する設定に戻す
+
+//		if(n==="base" || n == likeabase) bcondname = bcondition;
+	}
+
+	function loadImages(elm) {
+	// ここを介してイメージを読み込むこと
+		var start = System.getTickCount();
+		var l = kag.getLayerFromElm(elm);		// KAGレイヤを取得
+
+		if(!pluginenabled) {
+		// プラグインを使わないときは、普通に読むだけで戻る
+			try {
+				l.loadImages(elm);
+				dm('LayerConditionPlugin : '+elm.storage+' の読み込みに '+(System.getTickCount()-start)+'ms かかりました');
+			} catch(e) {
+				dm('LayerConditionPlugin : '+elm.storage+' の読込みに失敗しました。');
+				elm.storage = "dummy";
+				l.loadImages(elm);
+			}
+			return 0;
+		}
+
+		var ln = (string)elm.layer;
+		layer_image[ln] = elm.storage;			// 読み込まれる画像名保存
+		layer_opts[ln] = %[] if layer_opts[ln]===void;
+		layer_opts[ln].flip = (int)elm.fliplr+(int)elm.flipud*2;// フリップ状態保存
+
+		imageReader(l, elm);	// 画像読み込み
+
+		if(ln==='base') {
+			setLayerCondition(l, bcondition, 'base');
+		} else {
+			var ll = llower, lu = lupper;
+			if(lu>=ln && ln>=ll) {	// 位置合わせ適用範囲内のレイヤか
+				var lw = l.imageWidth, lh = l.imageHeight;
+				// cl=="adopt"なら処理は行わない
+				if(elm.cl!=='adopt') {
+					if(elm.left!==void) {
+					// left で指定された位置に置く
+						l.left = elm.left;
+					} else if(layer_position!==void) {
+					// デフォルト設定で指定されている位置に置く
+						l.left = layer_position[ln - ll] - lw/2;
+					} else {
+					// ウィンドウ横幅を前景レイヤ数で当分した位置に置く（だっけ？）
+						l.left = elm.cl!==void
+							? (elm.cl-lw\2) : (kag.fore.base.width\(lu-ll+2)*(ln-ll+1))-lw\2;
+					}
+				}
+				if(elm.ct!=='adopt') {
+					if(elm.top!==void) {
+						l.top = elm.top;
+					} else {
+						l.top = elm.ct!==void
+							? (elm.ct-lh\2) : (attachbottom ? kag.fore.base.height-lh : 0);
+					}
+				}
+			//	dm("LayerConditionPlugin @imageex 偏向 : "+l.left, elm.incleft);
+				if(elm.incleft!==void) { l.left += (int)elm.incleft; }
+				if(elm.inctop!==void) { l.top += (int)elm.inctop; }
+				l.absolute = layer_absolute[ln-ll] if elm.absolute===void;
+				l.type = autoSelect(elm.type, imagetype);
+				l.face = autoSelect(elm.face, imageface);
+				l.holdAlpha = autoSelect(elm.holdAlpha, imageHoldAlpha);
+				
+				l.opacity = autoSelect(elm.opacity, 255);
+			}
+			if(mlupper>=ln && ln>=mllower) {
+				setLayerCondition(l, (ln==likeabase ? bcondition : lcondition), (string)ln);
+			}
+		}
+		dm('LayerConditionPlugin : '+elm.storage+' の読み込みに '+(System.getTickCount()-start)+'ms かかりました');
+	}
+
+	function imageReader(l, elm) {
+	// l(レイヤ) に elm を処理して読み込む
+		var orgtagname = elm.tagname;	// オリジナルのタグ名の保存
+		elm.tagname = 'image';	// まず、ここは @image ですよの標識
+		kag.updateBeforeCh = 1;
+
+		// splitstring が含まれていない場合は、普通に読んで終了
+		if(elm.storage.indexOf(splitstring)===-1) {
+		//	l.loadImages(elm);
+			try {
+				l.loadImages(elm);
+				elm.tagname = orgtagname;	// 元のタグ名に戻す
+				return;
+			} catch(e) {
+				dm('+++ImagePooler.restraint+++ 画像 : '+elm.storage+' の読込みに失敗しました。');
+				elm.storage = "dummy";
+				l.loadImages(elm);
+				elm.tagname = orgtagname;	// 元のタグ名に戻す
+				return;
+			}
+		}
+
+		var is = insert;
+		var ad = elm.layer!=='base' ? addstring : addstringForBase;	// 小さく
+		var wod = elm.storage.split(splitstring,,false);	// 名前の分割
+
+	// addstring が無いならそこには insert も挟みません (pimage も同じ)
+		elm.storage=wod[0]+(ad[0]!==void ? is+ad[0]:'')+is+wod[1];
+		l.loadImages(elm);
+
+		for(var i=1;i<wod.count-1;i++) {	// 差分読込 -> wod は 1 から
+			elm.tagname = 'pimage';		// ここからは @pimage ですよの標識
+			if(wod[i+1].indexOf('%')!==-1) {
+			// % が名前の先頭にあれば、その画像名のまま読む
+				elm.storage = wod[i+1].replace(/\%/,);
+				wod.erase(i+1), i--;	// % は何所に挟んでも影響がないように
+			} else if(wod[i+1]!=='') {
+				elm.storage = wod[0]+(ad[i]!==(void||'')?is+ad[i]:'')+is+wod[i+1];
+			}
+			try {
+				l.loadPartialImage(elm);	// 読み込み
+			} catch {
+				dm("LayerConditionPlugin : "+elm.storage+"を見つけられませんでした");
+				// storage="キャラ/立/表情" で適切な表情差分が見つけられなかったときに
+				// 仮絵として汎用の"表情.png"を探してきて当てる
+				try {
+					elm.storage = wod[i+1].replace(/\%/,);
+					l.loadPartialImage(elm);	// 読み込み
+				} catch {
+					dm("LayerConditionPlugin : "+elm.storage+"を見つけられませんでした");
+				}
+			}
+		}
+		elm.tagname = orgtagname;	// 元のタグ名に戻す
+		return;
+	}
+
+	function unloadImages(elm) {
+		layer_image[(string)elm.layer] = void;
+	}
+
+	function changeCondition(elm) {
+	// コンディション設定。
+	// 前景用・背景用どちらかだけがあった場合、もう一方にコンディションは掛からない
+	// 優先順位は 前景＝背景＞全体
+		var s = situations;
+		var c = elm.condition;
+		var b = elm.base!==void ? elm.base : c;
+		var l = elm.layer!==void ? elm.layer : c;
+
+		if(c===void && b===void && l===void) return;	// 全部アレなら戻ろうか
+
+		if(c==='nothing') {
+			eraseCondition();
+			return;		// nothing でコンディション解除をここでも出来るように
+		} else if(c==='temp') {
+			tempconditionsets(elm) if(!elm.restored);	// restore 時には通りません
+			bcondition = tempcondition['b'];
+			lcondition = tempcondition['l'];
+		} else {
+			bcondition = void;
+			lcondition = void;
+			// どっちにもセット
+			if(c!==void)
+				for(var i=0;i<s[0].count;i++) {
+					if(s[0][i][0]==c) {	bcondition = s[0][i][1];
+										lcondition = s[0][i][1];
+										break;					 }
+				}
+			// 背景コンディションにセット
+			if(b!==void)
+				for(var i=0;i<s[1].count;i++) {
+					if(s[1][i][0]==b) {	bcondition = s[1][i][1]; break; }
+				}
+
+			// 前景コンディションにセット
+			if(l!==void)
+				for(var i=0;i<s[2].count;i++) {
+					if(s[2][i][0]==l) {	lcondition = s[2][i][1]; break; }
+				}
+		}
+		conditionname = c;
+		bcondname = b;
+		lcondname = l;
+	}
+
+	function tempconditionsets(elm) {
+	// paramnames から名前を拾って一時コンディションモード指定をする
+		var t = tempcondition, p = paramnames;
+
+		t['b'] = elm.bases.split(/, */,,false) if elm.bases!==void;	// 分割
+		t['l'] = elm.layers.split(/, */,,false) if elm.layers!==void;	// 分割
+
+		for(var i=0;i<p.count;i++) {
+		// 景別属性指定 → 共通属性指定 → 空文字列なら void に変更 の順
+			t['b'][i] = elm['b_'+p[i]]!==void ? elm['b_'+p[i]]
+			 : (elm[p[i]]!==void ? elm[p[i]] : (t['b'][i]!=='' ? t['b'][i] : void));
+			t['l'][i] = elm['l_'+p[i]]!==void ? elm['l_'+p[i]]
+			 : (elm[p[i]]!==void ? elm[p[i]] : (t['l'][i]!=='' ? t['l'][i] : void));
+		}
+		bcondname = void;	// rewrite用
+		lcondname = void;	// rewrite用
+	}
+
+	function eraseCondition() {
+	// コンディションを消去
+	// conditionname が nothing なら void にして、rewrite2Back() に引っかける
+		lcondition = bcondition = void;
+		bcondname = void;
+		lcondname = void;
+		conditionname = ( conditionname==='nothing' ? void : 'nothing' );
+		tempcondition = %[b:[],l:[]];	// テンプ抹消
+	}
+
+	function rewrite2Back() {
+	// 画像を全て裏に読み直す
+
+		// コンディション無しかコンディション変化無しなら再描画はしないよ
+		if(conditionname===void && bcondname===void && lcondname===void)
+			return;
+
+		var li = layer_image, lo = layer_opts;
+		loadImages(%[
+			layer:'base', page:'back', storage:li['base'],
+			fliplr:lo['base'].flip&1, flipud:((lo['base'].flip&2)==2),
+		]) if(li['base']!==void);
+		for(var i=mllower; i<=mlupper; i++) {
+			var n = (string)i;
+			loadImages(%[
+				layer:n, page:'back', storage:li[n],cl:'adopt', ct:'adopt',
+				fliplr:lo[n].flip&1, flipud:((lo[n].flip&2)==2),
+			]) if(li[n]!==void);
+		}
+	}
+
+	function applycondition(page) {
+	// page にコンディションを直接掛ける。 reStore で使用中
+		var tl = page==='fore' ? kag.fore : kag.back;
+		setLayerCondition(tl.base, bcondition, 'base');
+		for(var i=mllower; i<=mlupper; i++) {
+			setLayerCondition(tl.layers[i], (i==likeabase ? bcondition : lcondition), (string)i);
+		}
+	}
+
+	function stop() {
+	// 何もストップするモノはない
+	}
+
+	function setPluginConfig(elm) {
+		pluginenabled = elm.pluginenabled if elm.pluginenabled!==void;
+		llower = elm.llower if elm.llower!==void;		// 立ち絵制御適用前景レイヤ下限
+		lupper = elm.lupper if elm.lupper!==void;		// 立ち絵制御適用前景レイヤ上限
+		mllower = elm.mllower if elm.mllower!==void;	// 前景レイヤ下限(このプラグインの効果の及ぶ範囲)
+		mlupper = elm.mlupper if elm.mlupper!==void;	// 前景レイヤ上限
+		imageface = elm.imageface if elm.imageface!==void;
+		imagetype = elm.imagetype if elm.imagetype!==void;					// 前景、背景のタイプ
+		positionenabled = elm.positionenabled if elm.positionenabled!==void;
+
+		if(elm.layer_absolute!==void) {
+			var la = [];
+			la = elm.layer_absolute.split(/, */,,false);
+			for(var i=0;i<la.count;i++) { if(la[i]!==void) { layer_absolute[i] = la[i]; } }
+		}
+		if(elm.layer_position!==void) {
+			layer_position = [];
+			layer_position = elm.layer_position.split(/, */,,false);
+		}
+		attachbottom = elm.attachbottom if elm.attachbottom!==void;;
+	}
+
+// ↓	KAG用
+	function onStore(f, elm) {
+		f["LayerCondition"] = %[];
+		with(f["LayerCondition"]) {
+			.tcn = conditionname;
+			.tcb = bcondname;
+			.tcl = lcondname;
+
+			._image = %[];	(Dictionary.assign incontextof ._image)(layer_image);
+			._opts = %[];	(Dictionary.assign incontextof ._opts)(layer_opts);
+			.tmpc = %[];	(Dictionary.assign incontextof .tmpc)(tempcondition);
+
+			.llower = llower;		.lupper = lupper;
+			.mllower = mllower;		.mlupper = mlupper;
+			.imageface = imageface;	.imagetype = imagetype;
+			.layer_absolute = []; .layer_absolute.assignStruct(layer_absolute);
+			.layer_position = []; .layer_position.assignStruct(layer_position);
+			.attachbottom = attachbottom;
+			.positionenabled  = positionenabled;
+		}
+	}
+
+	function onRestore(f, clear, elm) {
+		var start = System.getTickCount();
+		if(f["LayerCondition"]===void) return;
+		with(f["LayerCondition"]) {
+			(Dictionary.assign incontextof layer_image)(._image);
+			(Dictionary.assign incontextof layer_opts)(._opts);
+			(Dictionary.assign incontextof tempcondition)(.tmpc);
+
+			llower = .llower;		lupper = .lupper;
+			mllower = .mllower;		mlupper = .mlupper;
+			imageface = .imageface;	imagetype = .imagetype;
+			attachbottom = .attachbottom;
+			positionenabled  = .positionenabled;
+			layer_absolute.assignStruct(.layer_absolute);
+			layer_position.assignStruct(.layer_position);
+
+			if(.tcn !== void || .tcb!==void || .tcl!==void) {
+			// 画像自体は KAG で読まれている（はず）なので、コンディションだけを適用
+				changeCondition( %[condition:.tcn, base:.tcb, layer:.tcl, restored:true] );
+				applycondition('fore');	// 表に
+				applycondition('back');	// 裏に
+			}
+		}
+		dm('LayerConditionPlugin : 復旧に '+(System.getTickCount()-start)+'ms 掛かりました');
+		stop();
+	}
+// ↑	KAG用
+	function ten2sixt(a, b, c, d) {
+	// 10進数 指定の色を 16進数 に直して返す	255 0 255 -> 0xFF00FF
+		return ((a&0xFF)<<24)|((b&0xFF)<<16)|((c&0xFF)<<8)|(d&0xFF);
+	}
+
+	function initLayer(absolute, enabled, face, opacity, type, visible, left, top, width, height, foreLayer, backLayer, hitThreshold) {
+		var base = kag.fore.base;
+		with(foreLayer) {
+			var b = backLayer;
+			.absolute	= b.absolute= (absolute !==void	? absolute	: 1000);
+			.enabled	= b.enabled	= (enabled !==void	? enabled	: true);
+			.face		= b.face	= (face !==void		? face		: dfAuto);
+			.opacity	= b.opacity	= (opacity !==void	? opacity	: 255);
+			.type		= b.type	= (type !==void		? type		: ltAlpha);
+			.visible	= b.visible	= (visible !==void	? visible	: false);
+			.left		= b.left	= (left !==void		? left		: 0);
+			.top		= b.top		= (top !==void		? top		: 0);
+			.width		= b.width	= (width !==void	? width		: base.width);
+			.height		= b.height	= (height !==void	? height	: base.height);
+
+			.hitThreshold = b.hitThreshold = hitThreshold if hitThreshold!==void;
+		}
+	}
+function autoSelect(i, els) {
+	return i!==void ? i : els;
+}
+}
+kag.addPlugin(global.LayerConditionPlugin_object = new LayerConditionPlugin(kag));
+// kag.tagHandlers.laycount(%[layers:kag.numCharacterLayers+1]);
+// LayerConditionPlugin_object.useLayer = kag.numCharacterLayers-1;
+
+/* @imageex - プラグインから画像読み込みをする	*/
+kag.tagHandlers.imageex = function(elm = %[]) {
+@if(__QUAKEPLUGIN_OBJECT_DEFINED__==1)
+	/*他*/	tagHandlers.quakexstopamoment();
+@endif
+	LayerConditionPlugin_object.loadImages(elm);
+@if(__QUAKEPLUGIN_OBJECT_DEFINED__==1)
+	/*他*/	tagHandlers.quakexupdatepos();
+	/*他*/	tagHandlers.quakexrecover();
+@endif
+	return 0;
+} incontextof kag;
+
+/* @condition_set - コンディションを指定する。nothing なら消す	*/
+kag.tagHandlers.condition_set = function(elm = %[]) {
+	LayerConditionPlugin_object.changeCondition(elm);
+	return 0;
+} incontextof kag;
+
+/* @condition_off - コンディションを消す 上で condition=nothing と同じ	*/
+kag.tagHandlers.condition_off = function() {
+	LayerConditionPlugin_object.changeCondition(%[condition:"nothing"]);
+	return 0;
+} incontextof kag;
+
+/* @tempcondition_set - 一時コンディションを名前を使って指定する	*/
+kag.tagHandlers.tempcondition_set = function(elm = %[]) {
+	LayerConditionPlugin_object.tempconditionsets(elm);
+	return 0;
+} incontextof kag;
+
+
+/* @condition2back - コンディションを今あるレイヤに直接掛ける	*/
+kag.tagHandlers.condition2back = function(elm = %[]) {
+	var p = elm.page!==void ? elm.page : 'back';
+	LayerConditionPlugin_object.applycondition(p);
+	return 0;
+} incontextof kag;
+
+/* @applycondition2back - 画像を読み直してコンディションを掛ける	*/
+kag.tagHandlers.applycondition2back = function() {
+	LayerConditionPlugin_object.rewrite2Back();
+	LayerConditionPlugin_object.applycondition(%[page:back]);
+	return 0;
+} incontextof kag;
+
+/* @unloadimage - プラグイン内の画像の名前を消去する。マクロ組込用	*/
+kag.tagHandlers.unloadimage = function(elm = %[]) {
+	LayerConditionPlugin_object.unloadImages(elm);
+	return 0;
+} incontextof kag;
+
+/* @freeimagex - freeimage にプラグインの配列消去を加えた拡張タグ	*/
+kag.tagHandlers.freeimagex = function(elm = %[]) {
+	var o = LayerConditionPlugin_object;
+	var f = kag.fore, b = kag.back;
+	if(elm.layer=='all') {
+		if(elm.page===void) {
+			f.base.freeImage(); b.base.freeImage();
+		} else {
+			if(elm.page=="fore")	{	f.base.freeImage(); 
+			} else 				{	b.base.freeImage();	}
+		}
+		o.unloadImages(%[layer:'base']);
+		for(var i=o.mllower; i<=o.mlupper; i++) {
+			if(elm.page===void) {
+				f.layers[i].freeImage(), b.layers[i].freeImage();
+			} else {
+				if(elm.page=="fore"){	f.layers[i].freeImage(); 
+				} else 				{	b.layers[i].freeImage();	}
+			}
+			o.unloadImages(%[layer:(string)i]);
+		}
+	} else {
+		if(elm.page===void) {
+			elm.page = 'fore', getLayerFromElm(elm).freeImage(elm);
+			elm.page = 'back', getLayerFromElm(elm).freeImage(elm);
+		} else {
+			getLayerFromElm(elm).freeImage(elm);
+		}
+		o.unloadImages(elm);
+	}
+	return 0;
+} incontextof kag;
+
+
+kag.tagHandlers.setlayerconditionconfig = function(elm = %[]) {
+	LayerConditionPlugin_object.setPluginConfig(elm);
+	return 0;
+} incontextof kag;
+
+@endif
